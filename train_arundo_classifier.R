@@ -15,7 +15,8 @@
 #                                     the 30 m grid. Created by
 #                                     build_predictor_rasters.R.
 #
-# Outputs (written to output/):
+# Outputs (written to output/). Accuracy tables are for kReportedSplit
+# (validation while tuning; switch to test for the final assessment):
 #   feature_set_comparison.csv  Accuracy and Kappa for each predictor subset.
 #   multiclass_<feature_set>_confusion_matrix.csv, ..._accuracy.csv,
 #   ..._variable_importance.csv  (one set per feature subset)
@@ -25,11 +26,16 @@
 #       (one per class threshold, all predictors; if kRunBinaryClassifiers)
 #   regression_<stratified|unstratified>_metrics.csv
 #       R^2, RMSE, MAE (percent cover), Spearman rank correlation with the true
-#       class, and weighted Kappa of binned predictions, per split.
+#       class, and weighted Kappa of binned predictions.
 #   regression_<stratified|unstratified>_confusion_matrix.csv, ..._accuracy.csv
-#       Test-set predictions binned back into the cover classes.
+#       Predictions binned back into the cover classes.
 #   regression_<stratified|unstratified>_variable_importance.csv, ..._map.tif
 #       (map in percent cover; if kRunCoverRegression)
+#   <model>_out_of_fold_map.tif, <model>_out_of_fold_confusion_matrix.csv,
+#   <model>_out_of_fold_accuracy.csv (+ _metrics.csv for regressions)
+#       For every mapped model (if kWriteOutOfFoldMaps): a map in which each
+#       spatial block is predicted by a model that never saw that block, and
+#       the accuracy of those predictions at the non-test sample pixels.
 #   All accuracy tables include unweighted, linear-weighted, and
 #   quadratic-weighted Kappa (weights treat the classes as ordered).
 #
@@ -39,9 +45,17 @@
 #      center falls inside a polygon (many samples per polygon). Pixels missing
 #      any predictor (e.g. outside LiDAR coverage) are dropped for ALL feature
 #      subsets so that the subsets are compared on identical samples.
-#   3. Split POLYGONS (not pixels) 70/15/15 into train/validation/test,
-#      stratified by class, so no polygon leaks across sets. Polygons left with
-#      no samples are excluded before splitting.
+#   3. Split POLYGONS (not pixels) into train/validation/test so no polygon
+#      leaks across sets. Polygons left with no samples are excluded first.
+#      With kSplitMethod = "spatial_blocks" (default) the study area is cut
+#      into square blocks (kSpatialBlockSizeMeters); each polygon belongs to
+#      the block holding the mean position of its pixels, and whole blocks are
+#      assigned to a split (~70/15/15 of the pixels), choosing among many
+#      random assignments the one that gives every class its fair share of
+#      polygons in every split. Neighboring polygons
+#      therefore share a split, so spatial autocorrelation between adjacent
+#      polygons does not inflate held-out accuracy. "random_polygons" instead
+#      splits polygons 70/15/15 at random, stratified by class.
 #   4. Train a multiclass classifier on each predictor subset, then a set of
 #      binary threshold classifiers on all predictors. By default
 #      (kStratifyTrainingByClass) the TRAINING pixels are subsampled to the same
@@ -54,15 +68,22 @@
 #      "75-95"), and a random forest regression predicts it from all predictors.
 #      It is run twice, with and without stratification (which, if used,
 #      balances the original classes).
-#   6. Report confusion matrices, accuracies, and Kappa on the test set, and
+#   6. Report confusion matrices, accuracies, and Kappa on kReportedSplit, and
 #      predict maps from the all-predictor models.
+#   7. Out-of-fold maps: spatial blocks are dealt into kOutOfFoldCount folds.
+#      For each fold, a model with the same settings is trained on the
+#      non-test polygons that have no pixel in that fold, and predicts the map
+#      cells (and sample pixels) in that fold. The resulting map's agreement
+#      with the polygons is an honest view of skill, unlike the main map,
+#      which reproduces the training polygons it was fit to. Test polygons are
+#      never used, so they stay held out.
 #
 # Assumptions to confirm (see notes in the accompanying message):
 #   - Binary classifiers label a pixel "Low" when its class is at or below the
 #     threshold class (e.g. "1-5" = classes <1 and 1-5) and "High" otherwise.
 #     When stratifying, Low and High are balanced against each other.
-#   - The validation set is used to report validation accuracy only; no
-#     hyperparameter tuning is performed yet.
+#   - No hyperparameter tuning is automated yet; results on kReportedSplit
+#     guide manual choices, so the test set should only be read at the end.
 
 library(sf)
 library(terra)
@@ -76,6 +97,19 @@ kPredictorDirectory <- "derived_predictors"
 kOutputDirectory <- "output"
 kSplitFractions <- c(train = 0.70, validation = 0.15, test = 0.15)
 kRandomSeed <- 42
+# "spatial_blocks" or "random_polygons" (see header, step 3).
+kSplitMethod <- "spatial_blocks"
+# Side length of the square spatial blocks used for splits and folds (meters).
+kSpatialBlockSizeMeters <- 3000
+# Random block assignments tried; the one with the most even class balance
+# across splits is kept (see AssignSpatialBlockSplits).
+kSplitCandidateCount <- 2000
+# Split whose accuracy is reported and written. Keep "validation" while
+# tuning; switch to "test" only for the final assessment.
+kReportedSplit <- "validation"
+# If TRUE, every mapped model also gets an out-of-fold map (header, step 7).
+kWriteOutOfFoldMaps <- TRUE
+kOutOfFoldCount <- 5
 # If TRUE, training pixels are sampled evenly from each class (see header).
 kStratifyTrainingByClass <- TRUE
 # Classes dropped from the analysis (too few polygons to stratify against).
@@ -123,10 +157,12 @@ LoadArundoPolygons <- function(kmz_path) {
 
 ExtractPixelsWithinPolygons <- function(landsat_scale_raster, polygons) {
   # Extracts every 30 m pixel whose center lies inside a polygon. Returns a
-  # data frame with polygon_id, arundo_class, and one column per band. Pixels
-  # with any missing band are dropped.
+  # data frame with polygon_id, arundo_class, one column per band, and the
+  # pixel center x and y (raster CRS). Pixels with any missing band are
+  # dropped.
   polygons_in_raster_crs <- st_transform(polygons, crs(landsat_scale_raster))
-  samples <- extract(landsat_scale_raster, vect(polygons_in_raster_crs))
+  samples <- extract(landsat_scale_raster, vect(polygons_in_raster_crs),
+                     xy = TRUE)
   # extract() returns the polygon's row index in column `ID`.
   samples$polygon_id <- polygons_in_raster_crs$polygon_id[samples$ID]
   samples$arundo_class <- polygons_in_raster_crs$arundo_class[samples$ID]
@@ -147,6 +183,77 @@ LoadPredictorStack <- function() {
 }
 
 # ---- Split by polygon -------------------------------------------------------
+
+BlockColumnAndRow <- function(x, y) {
+  # Returns a two-column matrix with the integer column and row of the square
+  # spatial block holding each (x, y) point (meters).
+  cbind(floor(x / kSpatialBlockSizeMeters), floor(y / kSpatialBlockSizeMeters))
+}
+
+AssignSpatialBlockSplits <- function(polygon_table) {
+  # polygon_table: data frame with block_id, arundo_class, and pixel_count per
+  # polygon. Assigns whole blocks to train/validation/test so that about
+  # kSplitFractions of the sampled PIXELS fall in each; every polygon takes
+  # its block's split. Blocks are few and classes cluster in space, so a
+  # single random assignment can leave a split with almost no polygons of a
+  # rare (high-cover) class. kSplitCandidateCount random block orders are
+  # therefore tried, and the one kept maximizes the worst ratio, over every
+  # class and split, of polygons received to polygons expected (split
+  # fraction x class polygon count). Returns polygon_table with `split`.
+  pixels_per_block <- tapply(polygon_table$pixel_count, polygon_table$block_id,
+                             sum)
+  expected_polygons <- outer(table(polygon_table$arundo_class), kSplitFractions)
+  SplitBlocks <- function(block_order) {
+    # Each block goes to the split whose cumulative pixel share holds the
+    # block's midpoint.
+    ordered_pixels <- pixels_per_block[block_order]
+    block_midpoint_share <- (cumsum(ordered_pixels) - ordered_pixels / 2) /
+      sum(ordered_pixels)
+    block_split <- names(kSplitFractions)[
+      findInterval(block_midpoint_share, cumsum(kSplitFractions)) + 1]
+    names(block_split) <- names(ordered_pixels)
+    factor(unname(block_split[polygon_table$block_id]),
+           levels = names(kSplitFractions))
+  }
+  set.seed(kRandomSeed)
+  best_split <- NULL
+  best_score <- -Inf
+  for (candidate in seq_len(kSplitCandidateCount)) {
+    candidate_split <- SplitBlocks(sample(length(pixels_per_block)))
+    received_polygons <- table(polygon_table$arundo_class, candidate_split)
+    score <- min(received_polygons / expected_polygons)
+    if (score > best_score) {
+      best_score <- score
+      best_split <- candidate_split
+    }
+  }
+  message(sprintf(paste("Best of %d block assignments: every class/split",
+                        "holds at least %.0f%% of its expected polygons"),
+                  kSplitCandidateCount, 100 * best_score))
+  polygon_table$split <- as.character(best_split)
+  polygon_table
+}
+
+MakeFoldLookup <- function(template_raster, sampled_x, sampled_y) {
+  # Deals every spatial block over template_raster's extent into one of
+  # kOutOfFoldCount folds. Blocks holding samples are dealt out evenly in
+  # random order; the remaining blocks get random folds. Returns a function
+  # of (x, y) giving the fold of each point.
+  first_block <- as.vector(BlockColumnAndRow(xmin(template_raster),
+                                             ymin(template_raster)))
+  last_block <- as.vector(BlockColumnAndRow(xmax(template_raster),
+                                            ymax(template_raster)))
+  block_counts <- last_block - first_block + 1
+  BlockIndex <- function(x, y) sweep(BlockColumnAndRow(x, y), 2, first_block) + 1
+  set.seed(kRandomSeed)
+  fold_by_block <- matrix(
+    sample.int(kOutOfFoldCount, prod(block_counts), replace = TRUE),
+    block_counts[1], block_counts[2])
+  sampled_blocks <- unique(BlockIndex(sampled_x, sampled_y))
+  fold_by_block[sampled_blocks] <- sample(
+    rep_len(seq_len(kOutOfFoldCount), nrow(sampled_blocks)))
+  function(x, y) fold_by_block[BlockIndex(x, y)]
+}
 
 AssignPolygonSplits <- function(polygons) {
   # Randomly assigns each polygon to train/validation/test, stratified by class
@@ -217,25 +324,26 @@ ComputeAccuracy <- function(observed, predicted) {
        quadratic_weighted_kappa = quadratic_weighted_kappa)
 }
 
+ReportClassAccuracy <- function(label, accuracy) {
+  message(sprintf(paste("%s: overall accuracy %.3f, kappa %.3f,",
+                        "weighted kappa %.3f (linear) %.3f (quadratic)"),
+                  label, accuracy$overall_accuracy, accuracy$kappa,
+                  accuracy$linear_weighted_kappa,
+                  accuracy$quadratic_weighted_kappa))
+}
+
 EvaluateAndWrite <- function(model, samples, response_name, output_prefix) {
-  # Reports validation and test accuracy; writes test-set tables to CSV.
-  # Returns list(validation, test) of ComputeAccuracy() results.
-  accuracy_by_split <- list()
-  for (split_name in c("validation", "test")) {
-    split_samples <- samples[samples$split == split_name, ]
-    predicted <- predict(model, data = split_samples)$predictions
-    # Align levels in case training dropped a class absent from its split.
-    predicted <- factor(predicted, levels = levels(split_samples[[response_name]]))
-    accuracy <- ComputeAccuracy(split_samples[[response_name]], predicted)
-    accuracy_by_split[[split_name]] <- accuracy
-    message(sprintf(paste("%s [%s]: overall accuracy %.3f, kappa %.3f,",
-                          "weighted kappa %.3f (linear) %.3f (quadratic)"),
-                    output_prefix, split_name, accuracy$overall_accuracy,
-                    accuracy$kappa, accuracy$linear_weighted_kappa,
-                    accuracy$quadratic_weighted_kappa))
-    if (split_name == "test") WriteAccuracyTables(accuracy, output_prefix)
-  }
-  accuracy_by_split
+  # Reports and writes the accuracy on the kReportedSplit pixels. Returns the
+  # ComputeAccuracy() result.
+  split_samples <- samples[samples$split == kReportedSplit, ]
+  predicted <- predict(model, data = split_samples)$predictions
+  # Align levels in case training dropped a class absent from its split.
+  predicted <- factor(predicted, levels = levels(split_samples[[response_name]]))
+  accuracy <- ComputeAccuracy(split_samples[[response_name]], predicted)
+  ReportClassAccuracy(sprintf("%s [%s]", output_prefix, kReportedSplit),
+                      accuracy)
+  WriteAccuracyTables(accuracy, output_prefix)
+  accuracy
 }
 
 WriteAccuracyTables <- function(accuracy, output_prefix) {
@@ -257,70 +365,74 @@ WriteAccuracyTables <- function(accuracy, output_prefix) {
             row.names = FALSE)
 }
 
-EvaluateRegressionAndWrite <- function(model, samples, response_name,
-                                       output_prefix) {
-  # Reports validation and test R^2, RMSE, and MAE against the pseudo-continuous
-  # cover; the Spearman rank correlation between predicted cover and the true
-  # class (the within-class random values carry no information, so ranks are
+ScoreRegression <- function(scored_samples, response_name, predicted,
+                            split_label) {
+  # Scores predicted cover against the pseudo-continuous cover: R^2, RMSE, MAE;
+  # the Spearman rank correlation between predicted cover and the true class
+  # (the within-class random values carry no information, so ranks are
   # compared against the class); and the accuracy of predictions binned back
-  # into cover classes. Writes <prefix>_metrics.csv and the test-set binned
-  # class tables.
-  # Returns list(validation, test) of binned-class ComputeAccuracy() results.
-  class_names <- levels(samples$arundo_class)
+  # into cover classes. split_label names the scored pixels in the output.
+  # Returns list(metrics = one-row data frame, accuracy = binned
+  # ComputeAccuracy() result).
+  class_names <- levels(scored_samples$arundo_class)
   # A prediction falls in the class whose range contains it (lower bound
   # inclusive); values beyond the outer classes go to the outer classes.
   class_upper_bounds <- vapply(kClassCoverRangePercent[class_names], `[`,
                                numeric(1), 2)
-  class_midpoints <- vapply(kClassCoverRangePercent[class_names], mean, numeric(1))
+  class_midpoints <- vapply(kClassCoverRangePercent[class_names], mean,
+                            numeric(1))
   RSquared <- function(observed, predicted) {
     1 - sum((observed - predicted)^2) / sum((observed - mean(observed))^2)
   }
-
-  accuracy_by_split <- list()
-  metrics <- list()
-  for (split_name in c("validation", "test")) {
-    split_samples <- samples[samples$split == split_name, ]
-    observed <- split_samples[[response_name]]
-    predicted <- predict(model, data = split_samples)$predictions
-    errors <- predicted - observed
+  observed <- scored_samples[[response_name]]
+  errors <- predicted - observed
+  predicted_class <- factor(
+    class_names[findInterval(predicted, head(class_upper_bounds, -1)) + 1],
+    levels = class_names)
+  accuracy <- ComputeAccuracy(scored_samples$arundo_class, predicted_class)
+  metrics <- data.frame(
+    split = split_label, r_squared = RSquared(observed, predicted),
+    rmse = sqrt(mean(errors^2)), mae = mean(abs(errors)),
     # R^2 from predicting each pixel's true class midpoint: the best a model
     # could do given the random within-class noise in the target.
-    midpoint_r_squared <- RSquared(
-      observed, class_midpoints[as.character(split_samples$arundo_class)])
-    metrics[[split_name]] <- data.frame(
-      split = split_name, r_squared = RSquared(observed, predicted),
-      rmse = sqrt(mean(errors^2)), mae = mean(abs(errors)),
-      r_squared_if_class_known = midpoint_r_squared)
+    r_squared_if_class_known = RSquared(
+      observed, class_midpoints[as.character(scored_samples$arundo_class)]),
+    spearman_rank_correlation = cor(
+      predicted, as.integer(scored_samples$arundo_class), method = "spearman"),
+    binned_accuracy = accuracy$overall_accuracy,
+    binned_kappa = accuracy$kappa,
+    binned_linear_weighted_kappa = accuracy$linear_weighted_kappa,
+    binned_quadratic_weighted_kappa = accuracy$quadratic_weighted_kappa)
+  list(metrics = metrics, accuracy = accuracy)
+}
 
-    predicted_class <- factor(
-      class_names[findInterval(predicted, head(class_upper_bounds, -1)) + 1],
-      levels = class_names)
-    accuracy <- ComputeAccuracy(split_samples$arundo_class, predicted_class)
-    accuracy_by_split[[split_name]] <- accuracy
-    metrics[[split_name]]$spearman_rank_correlation <- cor(
-      predicted, as.integer(split_samples$arundo_class), method = "spearman")
-    metrics[[split_name]]$binned_accuracy <- accuracy$overall_accuracy
-    metrics[[split_name]]$binned_kappa <- accuracy$kappa
-    metrics[[split_name]]$binned_linear_weighted_kappa <-
-      accuracy$linear_weighted_kappa
-    metrics[[split_name]]$binned_quadratic_weighted_kappa <-
-      accuracy$quadratic_weighted_kappa
-    message(sprintf(paste("%s [%s]: R^2 %.3f (%.3f if class known), RMSE %.1f,",
-                          "Spearman %.3f, binned class accuracy %.3f,",
-                          "kappa %.3f, weighted kappa %.3f (linear)",
-                          "%.3f (quadratic)"),
-                    output_prefix, split_name, metrics[[split_name]]$r_squared,
-                    midpoint_r_squared, metrics[[split_name]]$rmse,
-                    metrics[[split_name]]$spearman_rank_correlation,
-                    accuracy$overall_accuracy, accuracy$kappa,
-                    accuracy$linear_weighted_kappa,
-                    accuracy$quadratic_weighted_kappa))
-    if (split_name == "test") WriteAccuracyTables(accuracy, output_prefix)
-  }
-  write.csv(do.call(rbind, metrics),
+ReportAndWriteRegression <- function(scores, label, output_prefix) {
+  # Prints ScoreRegression() results and writes <prefix>_metrics.csv and the
+  # binned class tables.
+  with(scores$metrics, message(sprintf(
+    paste("%s: R^2 %.3f (%.3f if class known), RMSE %.1f, Spearman %.3f,",
+          "binned class accuracy %.3f, kappa %.3f, weighted kappa %.3f",
+          "(linear) %.3f (quadratic)"),
+    label, r_squared, r_squared_if_class_known, rmse,
+    spearman_rank_correlation, binned_accuracy, binned_kappa,
+    binned_linear_weighted_kappa, binned_quadratic_weighted_kappa)))
+  WriteAccuracyTables(scores$accuracy, output_prefix)
+  write.csv(scores$metrics,
             file.path(kOutputDirectory, paste0(output_prefix, "_metrics.csv")),
             row.names = FALSE)
-  accuracy_by_split
+}
+
+EvaluateRegressionAndWrite <- function(model, samples, response_name,
+                                       output_prefix) {
+  # Scores the regression on the kReportedSplit pixels (see ScoreRegression)
+  # and writes the results. Returns the binned-class ComputeAccuracy() result.
+  split_samples <- samples[samples$split == kReportedSplit, ]
+  predicted <- predict(model, data = split_samples)$predictions
+  scores <- ScoreRegression(split_samples, response_name, predicted,
+                            kReportedSplit)
+  ReportAndWriteRegression(scores, sprintf("%s [%s]", output_prefix,
+                                           kReportedSplit), output_prefix)
+  scores$accuracy
 }
 
 # ---- Training ---------------------------------------------------------------
@@ -341,31 +453,110 @@ StratifiedSample <- function(training_samples, response_name) {
   training_samples[selected_rows, ]
 }
 
-TrainAndMap <- function(samples, predictor_raster, response_name, output_prefix,
-                        predict_map = FALSE,
-                        stratify_training = kStratifyTrainingByClass,
-                        stratify_by = response_name) {
-  # Trains on the training split using the layers of predictor_raster as
-  # predictors, evaluates, and optionally predicts a map. A numeric response
-  # gives a regression forest, a factor a classification forest. stratify_by
-  # names the column whose levels are balanced when stratifying (it is not
-  # used as a predictor). Returns list(model, out_of_bag_accuracy, accuracy)
-  # where accuracy is the list from EvaluateAndWrite() or
-  # EvaluateRegressionAndWrite(); out_of_bag_accuracy is NA for regression.
-  predictor_names <- names(predictor_raster)
-  is_regression <- is.numeric(samples[[response_name]])
-  training_samples <- samples[samples$split == "train", ]
+FitForest <- function(training_samples, response_name, predictor_names,
+                      stratify_training, stratify_by) {
+  # Fits a ranger forest of response_name on predictor_names, after balancing
+  # the levels of stratify_by if stratify_training. A numeric response gives a
+  # regression forest, a factor a classification forest.
   if (stratify_training) {
     training_samples <- StratifiedSample(training_samples, stratify_by)
   }
-  training_samples <- training_samples[, c(response_name, predictor_names)]
-  model <- ranger(
+  ranger(
     formula = as.formula(paste(response_name, "~ .")),
-    data = training_samples,
+    data = training_samples[, c(response_name, predictor_names)],
     num.trees = 500,
     importance = "impurity",
     seed = kRandomSeed
   )
+}
+
+PredictionsAsValues <- function(predictions, class_levels) {
+  # Class predictions become their index in class_levels (as stored in class
+  # maps); regression predictions are returned unchanged.
+  if (is.factor(predictions)) {
+    match(as.character(predictions), class_levels)
+  } else {
+    predictions
+  }
+}
+
+WriteOutOfFold <- function(samples, predictor_raster, response_name,
+                           output_prefix, stratify_training, stratify_by,
+                           fold_raster) {
+  # Blocked cross-validation over the non-test polygons (header, step 7).
+  # samples must hold polygon_id and map_fold (the fold of each pixel's
+  # block); fold_raster holds the fold of every map cell, in layer map_fold.
+  # Writes <prefix>_out_of_fold_map.tif and the out-of-fold accuracy tables.
+  predictor_names <- names(predictor_raster)
+  class_levels <- levels(samples[[response_name]])  # NULL for regression.
+  cv_samples <- samples[samples$split != "test", ]
+  out_of_fold_predictions <- rep(NA_real_, nrow(cv_samples))
+  models <- lapply(seq_len(kOutOfFoldCount), function(fold) {
+    # Drop every polygon with any pixel in this fold, so no polygon that
+    # reaches into the fold's blocks trains the model that predicts them.
+    polygons_in_fold <- unique(cv_samples$polygon_id[cv_samples$map_fold == fold])
+    training_samples <- cv_samples[!cv_samples$polygon_id %in% polygons_in_fold, ]
+    FitForest(training_samples, response_name, predictor_names,
+              stratify_training, stratify_by)
+  })
+  for (fold in seq_len(kOutOfFoldCount)) {
+    fold_rows <- which(cv_samples$map_fold == fold)
+    out_of_fold_predictions[fold_rows] <- PredictionsAsValues(
+      predict(models[[fold]], data = cv_samples[fold_rows, ])$predictions,
+      class_levels)
+  }
+
+  out_of_fold_prefix <- paste0(output_prefix, "_out_of_fold")
+  label <- sprintf("%s [out-of-fold, %d folds, non-test pixels]",
+                   output_prefix, kOutOfFoldCount)
+  if (is.null(class_levels)) {
+    ReportAndWriteRegression(
+      ScoreRegression(cv_samples, response_name, out_of_fold_predictions,
+                      "out_of_fold"),
+      label, out_of_fold_prefix)
+  } else {
+    accuracy <- ComputeAccuracy(
+      cv_samples[[response_name]],
+      factor(class_levels[out_of_fold_predictions], levels = class_levels))
+    ReportClassAccuracy(label, accuracy)
+    WriteAccuracyTables(accuracy, out_of_fold_prefix)
+  }
+
+  predict(c(predictor_raster, fold_raster), models, na.rm = TRUE,
+          fun = function(models, data, ...) {
+            values <- rep(NA_real_, nrow(data))
+            for (fold in seq_along(models)) {
+              fold_rows <- which(data$map_fold == fold)
+              if (length(fold_rows) == 0) next
+              values[fold_rows] <- PredictionsAsValues(
+                predict(models[[fold]], data = data[fold_rows, , drop = FALSE])$predictions,
+                class_levels)
+            }
+            values
+          },
+          filename = file.path(kOutputDirectory,
+                               paste0(out_of_fold_prefix, "_map.tif")),
+          overwrite = TRUE)
+  invisible(NULL)
+}
+
+TrainAndMap <- function(samples, predictor_raster, response_name, output_prefix,
+                        predict_map = FALSE,
+                        stratify_training = kStratifyTrainingByClass,
+                        stratify_by = response_name, fold_raster = NULL) {
+  # Trains on the training split using the layers of predictor_raster as
+  # predictors, evaluates on kReportedSplit, and optionally predicts a map. A
+  # numeric response gives a regression forest, a factor a classification
+  # forest. stratify_by names the column whose levels are balanced when
+  # stratifying (it is not used as a predictor). If predict_map and
+  # fold_raster is given, an out-of-fold map is written too (WriteOutOfFold).
+  # Returns list(model, out_of_bag_accuracy, accuracy) where accuracy is the
+  # result of EvaluateAndWrite() or EvaluateRegressionAndWrite();
+  # out_of_bag_accuracy is NA for regression.
+  predictor_names <- names(predictor_raster)
+  is_regression <- is.numeric(samples[[response_name]])
+  model <- FitForest(samples[samples$split == "train", ], response_name,
+                     predictor_names, stratify_training, stratify_by)
   out_of_bag_accuracy <- if (is_regression) NA else 1 - model$prediction.error
   if (is_regression) {
     message(sprintf("%s [out-of-bag]: R^2 %.3f", output_prefix, model$r.squared))
@@ -386,15 +577,20 @@ TrainAndMap <- function(samples, predictor_raster, response_name, output_prefix,
   }
 
   if (predict_map) {
+    class_levels <- levels(samples[[response_name]])
     predict(predictor_raster, model, na.rm = TRUE,
             fun = function(model, data, ...) {
-              predictions <- predict(model, data = data)$predictions
               # Class maps store the class index; regression maps store cover.
-              if (is.factor(predictions)) as.integer(predictions) else predictions
+              PredictionsAsValues(predict(model, data = data)$predictions,
+                                  class_levels)
             },
             filename = file.path(kOutputDirectory,
                                  paste0(output_prefix, "_map.tif")),
             overwrite = TRUE)
+    if (!is.null(fold_raster)) {
+      WriteOutOfFold(samples, predictor_raster, response_name, output_prefix,
+                     stratify_training, stratify_by, fold_raster)
+    }
   }
   list(model = model, out_of_bag_accuracy = out_of_bag_accuracy,
        accuracy = accuracy)
@@ -423,12 +619,42 @@ Main <- function() {
   print(table(samples$arundo_class))
 
   # Split polygons that actually have samples, then attach splits to pixels.
-  polygons <- AssignPolygonSplits(
-    polygons[polygons$polygon_id %in% samples$polygon_id, ])
-  samples <- merge(samples,
-                   st_drop_geometry(polygons)[, c("polygon_id", "split")],
+  # Each polygon is placed at the mean position of its sampled pixels.
+  polygon_table <- aggregate(cbind(x, y) ~ polygon_id, data = samples,
+                             FUN = mean)
+  polygon_table$pixel_count <- as.vector(
+    table(samples$polygon_id)[as.character(polygon_table$polygon_id)])
+  polygon_table$arundo_class <- polygons$arundo_class[
+    match(polygon_table$polygon_id, polygons$polygon_id)]
+  polygon_block <- BlockColumnAndRow(polygon_table$x, polygon_table$y)
+  polygon_table$block_id <- paste(polygon_block[, 1], polygon_block[, 2])
+  polygon_table <- switch(kSplitMethod,
+                          spatial_blocks = AssignSpatialBlockSplits(polygon_table),
+                          random_polygons = AssignPolygonSplits(polygon_table),
+                          stop("Unknown kSplitMethod: ", kSplitMethod))
+  samples <- merge(samples, polygon_table[, c("polygon_id", "split")],
                    by = "polygon_id")
-  samples$polygon_id <- NULL  # Not a predictor.
+  message(sprintf("Split method: %s (%d blocks of %d m with samples)",
+                  kSplitMethod, length(unique(polygon_table$block_id)),
+                  kSpatialBlockSizeMeters))
+  message("Polygons per class and split:")
+  print(table(polygon_table$arundo_class, polygon_table$split))
+  message("Sampled pixels per class and split:")
+  print(table(samples$arundo_class, samples$split))
+  # polygon_id, x, y (and map_fold below) stay in samples for the out-of-fold
+  # maps; TrainAndMap() only passes the predictor columns to the forest.
+
+  fold_raster <- NULL
+  if (kWriteOutOfFoldMaps) {
+    FoldAt <- MakeFoldLookup(predictor_stack, samples$x, samples$y)
+    samples$map_fold <- FoldAt(samples$x, samples$y)
+    fold_raster <- rast(predictor_stack, nlyrs = 1)
+    cell_centers <- xyFromCell(fold_raster, seq_len(ncell(fold_raster)))
+    values(fold_raster) <- FoldAt(cell_centers[, 1], cell_centers[, 2])
+    names(fold_raster) <- "map_fold"
+    message("Non-test sampled pixels per out-of-fold fold:")
+    print(table(samples$map_fold[samples$split != "test"]))
+  }
 
   # Version 1: predict the Arundo cover class directly, for each predictor
   # subset, to see what each data source contributes.
@@ -447,18 +673,17 @@ Main <- function() {
   comparison <- do.call(rbind, lapply(names(feature_sets), function(set_name) {
     result <- TrainAndMap(samples, predictor_stack[[feature_sets[[set_name]]]],
                           "arundo_class", paste0("multiclass_", set_name),
-                          predict_map = (set_name == "all"))
+                          predict_map = (set_name == "all"),
+                          fold_raster = fold_raster)
     data.frame(feature_set = set_name,
                predictor_count = length(feature_sets[[set_name]]),
                out_of_bag_accuracy = result$out_of_bag_accuracy,
-               validation_accuracy = result$accuracy$validation$overall_accuracy,
-               validation_kappa = result$accuracy$validation$kappa,
-               test_accuracy = result$accuracy$test$overall_accuracy,
-               test_kappa = result$accuracy$test$kappa,
-               test_linear_weighted_kappa =
-                 result$accuracy$test$linear_weighted_kappa,
-               test_quadratic_weighted_kappa =
-                 result$accuracy$test$quadratic_weighted_kappa)
+               evaluated_split = kReportedSplit,
+               accuracy = result$accuracy$overall_accuracy,
+               kappa = result$accuracy$kappa,
+               linear_weighted_kappa = result$accuracy$linear_weighted_kappa,
+               quadratic_weighted_kappa =
+                 result$accuracy$quadratic_weighted_kappa)
   }))
   print(comparison)
   write.csv(comparison, file.path(kOutputDirectory, "feature_set_comparison.csv"),
@@ -475,7 +700,7 @@ Main <- function() {
       binary_samples <- samples[, setdiff(names(samples), "arundo_class")]
       TrainAndMap(binary_samples, predictor_stack, "cover_relative_to_threshold",
                   paste0("binary_", gsub("[<>]", "", class_name)),
-                  predict_map = TRUE)
+                  predict_map = TRUE, fold_raster = fold_raster)
     }
   }
 
@@ -495,7 +720,7 @@ Main <- function() {
                   paste0("regression_", ifelse(stratify_regression, "stratified",
                                                "unstratified")),
                   predict_map = TRUE, stratify_training = stratify_regression,
-                  stratify_by = "arundo_class")
+                  stratify_by = "arundo_class", fold_raster = fold_raster)
     }
   }
 }

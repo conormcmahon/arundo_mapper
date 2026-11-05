@@ -1,4 +1,5 @@
 derived_predictors/
 output/
-output_maps/
 output_all_samples/
+output_random_splits/
+output_random_squares/
